@@ -14,7 +14,52 @@ Rokid 眼镜 <──wss──> rcs.rokid.com/claw/ws/link <──wss──> 本�
 
 ## 安装
 
+### 方式一：让 Hermes 自动安装
+
+把以下提示词发给 Hermes，它会自动完成克隆、编译、配置、启动全流程：
+
+---
+
+> 请帮我安装 rokid-hermes-bridge（Rokid 眼镜接入 Hermes 的桥接服务）。
+>
+> **步骤：**
+>
+> 1. 用 PowerShell 克隆仓库（如已存在则 `git pull` 更新）：
+>    ```
+>    git clone https://github.com/LShang001/rokid-hermes-bridge.git C:\rokid-hermes-bridge
+>    ```
+>
+> 2. 安装依赖并编译：
+>    ```
+>    cd C:\rokid-hermes-bridge
+>    npm install
+>    npm run build
+>    ```
+>
+> 3. 创建 `.env` 文件，内容如下（变量值按说明填写）：
+>    - `ROKID_LINK_CODE` 和 `ROKID_LINK_SECRET`：**向我询问**，来自 Rokid 眼镜配对界面
+>    - `HERMES_API_KEY`：从 `~/.hermes/config.yaml` 的 `platforms.api_server.extra.key` 读取
+>    - `HERMES_BASE_URL`：`http://127.0.0.1:8642`
+>
+> 4. 后台启动服务并验证：
+>    ```
+>    # 启动（后台）
+>    Start-Process node -ArgumentList "--env-file-if-exists=.env dist/index.js" -WorkingDirectory C:\rokid-hermes-bridge -WindowStyle Hidden
+>    # 验证
+>    Start-Sleep 3
+>    curl http://127.0.0.1:9642/stats
+>    ```
+>
+> 5. （可选）用 Hermes cron 保持常驻：
+>    设置一个每 5 分钟运行的 cron job，检查进程是否存活，如不存在则重新启动。
+
+---
+
+### 方式二：手动安装
+
 ```bash
+git clone https://github.com/LShang001/rokid-hermes-bridge.git
+cd rokid-hermes-bridge
 npm install
 npm run build
 cp .env.example .env
@@ -43,13 +88,10 @@ npm run dev
 | `ROKID_RECONNECT_MAX` | 否 | 断线重连最大次数，默认 10 |
 | `ROKID_RECONNECT_DELAY` | 否 | 重连基础延迟（毫秒），默认 1000 |
 | `HERMES_REASONING` | 否 | 思考强度 `off`/`low`/`medium`/`high`，默认 `off` |
+| `HERMES_TIMEOUT_SEC` | 否 | Hermes 请求超时（秒），默认 60 |
 | `ROKID_SESSION_IDLE_SEC` | 否 | 空闲多久开新会话（秒），默认 600 |
-
-**注意**：本项目不依赖 `dotenv`，`.env` 文件不会被自动加载。运行前需要自己 `export` 这些变量，或者用 `dotenv-cli` / `env-cmd` 之类的工具，或者直接在命令行内联传入：
-
-```bash
-ROKID_LINK_CODE=xxx ROKID_LINK_SECRET=yyy HERMES_API_KEY=zzz npm start
-```
+| `BRIDGE_HTTP_PORT` | 否 | Stats HTTP 端口，默认 9642，设为 0 禁用 |
+| `BRIDGE_VERBOSE` | 否 | 设为 `1` 打印每帧完整内容（含对话文字） |
 
 ## 设备工具调用（拍照/导航/日程/退出）
 
