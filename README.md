@@ -16,44 +16,12 @@ Rokid 眼镜 <──wss──> rcs.rokid.com/claw/ws/link <──wss──> 本�
 
 ### 方式一：让 Hermes 自动安装
 
-把以下提示词发给 Hermes，它会自动完成克隆、编译、配置、启动全流程：
+把这句话发给 Hermes：
 
----
+> 请帮我安装并启动这个项目：https://github.com/LShang001/rokid-hermes-bridge
+> 需要向我询问 Rokid 眼镜的 linkCode 和 linkSecret（来自眼镜配对界面）。
 
-> 请帮我安装 rokid-hermes-bridge（Rokid 眼镜接入 Hermes 的桥接服务）。
->
-> **步骤：**
->
-> 1. 用 PowerShell 克隆仓库（如已存在则 `git pull` 更新）：
->    ```
->    git clone https://github.com/LShang001/rokid-hermes-bridge.git C:\rokid-hermes-bridge
->    ```
->
-> 2. 安装依赖并编译：
->    ```
->    cd C:\rokid-hermes-bridge
->    npm install
->    npm run build
->    ```
->
-> 3. 创建 `.env` 文件，内容如下（变量值按说明填写）：
->    - `ROKID_LINK_CODE` 和 `ROKID_LINK_SECRET`：**向我询问**，来自 Rokid 眼镜配对界面
->    - `HERMES_API_KEY`：从 `~/.hermes/config.yaml` 的 `platforms.api_server.extra.key` 读取
->    - `HERMES_BASE_URL`：`http://127.0.0.1:8642`
->
-> 4. 后台启动服务并验证：
->    ```
->    # 启动（后台）
->    Start-Process node -ArgumentList "--env-file-if-exists=.env dist/index.js" -WorkingDirectory C:\rokid-hermes-bridge -WindowStyle Hidden
->    # 验证
->    Start-Sleep 3
->    curl http://127.0.0.1:9642/stats
->    ```
->
-> 5. （可选）用 Hermes cron 保持常驻：
->    设置一个每 5 分钟运行的 cron job，检查进程是否存活，如不存在则重新启动。
-
----
+Hermes 会自己读文档完成安装。
 
 ### 方式二：手动安装
 
