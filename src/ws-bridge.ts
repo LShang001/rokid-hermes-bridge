@@ -18,6 +18,8 @@ export interface BridgeConfig {
   reconnectMaxRetries: number;
   /** 重连基础延迟 (ms) */
   reconnectBaseDelayMs: number;
+  /** 空闲多久后开启新会话（毫秒），避免历史无限增长拖慢首字延迟 */
+  sessionIdleMs: number;
   /** Hermes Gateway 配置 */
   hermes: HermesConfig;
 }
@@ -105,6 +107,27 @@ export function createBridgeService(config: BridgeConfig) {
 
   /** 当前活跃请求的 AbortController */
   let activeCtrl: AbortController | null = null;
+
+  /** 当前会话 id（传给 Hermes 的 X-Hermes-Session-Id），空闲超时后轮换 */
+  let sessionId: string | null = null;
+  let lastRequestAt = 0;
+
+  /**
+   * 取当前会话 id。空闲超过 sessionIdleMs 就开新会话：
+   * Hermes 会把历史回灌进 prompt，无限增长会持续拖慢首字延迟。
+   */
+  function resolveSessionId(): string {
+    const now = Date.now();
+    const expired = lastRequestAt > 0 && now - lastRequestAt > config.sessionIdleMs;
+    if (!sessionId || expired) {
+      if (expired) {
+        console.log(`[ws] Session idle > ${Math.round(config.sessionIdleMs / 1000)}s, starting new session`);
+      }
+      sessionId = `rokid-${config.linkCode}-${now.toString(36)}`;
+    }
+    lastRequestAt = now;
+    return sessionId;
+  }
 
   function sendWs(msg: OutboundFrame) {
     if (ws?.readyState === WebSocket.OPEN) {
@@ -212,10 +235,11 @@ export function createBridgeService(config: BridgeConfig) {
     activeCtrl = ctrl;
     toolCallEmitted = false;
 
-    console.log(`[ws] Processing request ${request.requestId}, messages=${request.messages.length}`);
+    const hermesSessionId = resolveSessionId();
+    console.log(`[ws] Processing request ${request.requestId}, messages=${request.messages.length}, session=${hermesSessionId}`);
 
     try {
-      await streamToHermes(config.hermes, request.messages, ctrl.signal, {
+      await streamToHermes(config.hermes, request.messages, hermesSessionId, ctrl.signal, {
         onDelta: (delta) => {
           if (ctrl.signal.aborted || toolCallEmitted) return;
           sendStreamChunk(request.requestId, delta);

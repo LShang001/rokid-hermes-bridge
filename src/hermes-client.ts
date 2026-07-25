@@ -4,9 +4,14 @@
 
 import type { MessageObject, DeviceToolCall } from "./protocol.js";
 
+/** 思考强度：off 关闭推理（最快），其余为 Hermes 的 effort 档位 */
+export type ReasoningLevel = "off" | "low" | "medium" | "high";
+
 export interface HermesConfig {
   baseUrl: string;
   apiKey: string;
+  /** 眼镜场景默认降低思考强度以压低首字延迟 */
+  reasoning: ReasoningLevel;
 }
 
 export interface StreamCallbacks {
@@ -115,7 +120,13 @@ export function parseToolFenceJson(raw: string): DeviceToolCall | null {
   }
 }
 
-const TOOL_CONVENTION_SYSTEM_PROMPT = `如果需要下发设备指令（拍照/导航/日程/退出），不要用普通文字描述，而是在回复中单独输出如下格式的代码块（可以在代码块前后正常说话）：
+const TOOL_CONVENTION_SYSTEM_PROMPT = `你现在通过 Rokid AR 眼镜和用户语音对话，回复会被逐字转成语音播报给用户听，不是显示成文档。请遵守：
+- 用口语化的短句回答，像日常聊天一样，不要用书面语或列举式的长篇说明。
+- 不要使用任何 markdown 语法（不要加粗 **、不要用标题 #、不要用列表 - / 1.、不要用代码块围栏，除非是下面的设备指令约定）。
+- 一般问题控制在 2-3 句话以内说完重点，不要展开成大段罗列。
+- 不要暴露内部实现细节（文件路径、代码、工具名、技术架构），用户只是在和眼镜对话，不需要知道这些。
+
+如果需要下发设备指令（拍照/导航/日程/退出），不要用普通文字描述，而是在回复中单独输出如下格式的代码块（可以在代码块前后正常说话）：
 
 \`\`\`rokid-tool
 {"command": "take_photo"}
@@ -173,15 +184,24 @@ function toOpenAIMessages(messages: MessageObject[]): OpenAIMessage[] {
 export async function streamToHermes(
   config: HermesConfig,
   messages: MessageObject[],
+  sessionId: string,
   signal: AbortSignal,
   callbacks: StreamCallbacks
 ): Promise<void> {
   const openaiMessages = toOpenAIMessages(messages);
 
+  // model_options 是 Hermes 的逐请求运行时覆盖，只影响本次调用，
+  // 不改动 Hermes 全局配置（CLI 等其它平台不受影响）。
+  const reasoning =
+    config.reasoning === "off"
+      ? { enabled: false }
+      : { enabled: true, effort: config.reasoning };
+
   const body = JSON.stringify({
     model: "hermes-agent",
     messages: openaiMessages,
     stream: true,
+    model_options: { reasoning },
   });
 
   const url = `${config.baseUrl}/v1/chat/completions`;
@@ -193,6 +213,10 @@ export async function streamToHermes(
       headers: {
         "Authorization": `Bearer ${config.apiKey}`,
         "Content-Type": "application/json",
+        // 不带此头时 Hermes 会用 hash(system_prompt + 首条 user 消息) 推导
+        // session id，而桥接每次只发当前一句话，导致每轮都变成新会话、
+        // 上下文丢失。显式带上稳定 id，让 Hermes 从 state.db 读取历史。
+        "X-Hermes-Session-Id": sessionId,
       },
       body,
       signal,
