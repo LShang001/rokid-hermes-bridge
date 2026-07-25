@@ -2,8 +2,10 @@
 // Rokid-Hermes Bridge — 入口
 // ============================================================
 // 用法:
-//   设置环境变量 → npm run dev
-//   或: LINK_CODE=xxx LINK_SECRET=yyy node dist/index.js
+//   cp .env.example .env  # 填入配置
+//   npm run dev           # 编译并启动（.env 由 --env-file-if-exists 自动加载）
+//
+//   内联覆盖单个值：HERMES_REASONING=high npm start
 // ============================================================
 
 import { createBridgeService, type BridgeConfig } from "./ws-bridge.js";

@@ -12,11 +12,8 @@ npm run dev      # 编译并运行
 npm start        # 只运行 dist/
 ```
 
-启动必须显式带环境变量——**`.env` 不会被自动加载**，项目没装 dotenv：
-
-```bash
-ROKID_LINK_CODE=xxx ROKID_LINK_SECRET=yyy HERMES_API_KEY=zzz npm start
-```
+配置从 `.env` 读（`--env-file-if-exists`，需 Node ≥ 20.12）。已设好的环境变量优先于 `.env`，
+所以内联覆盖单个值仍然可用：`HERMES_REASONING=high npm start`。
 
 无测试框架。验证方式见 §原则 第 2 条。
 

@@ -22,6 +22,9 @@ cp .env.example .env
 npm start
 ```
 
+`.env` 通过 `--env-file-if-exists` 自动加载（需 Node ≥ 20.12，无需 dotenv）。
+已设好的环境变量优先于 `.env`，单个值可内联覆盖：`HERMES_REASONING=high npm start`。
+
 开发模式（改完直接编译+运行）：
 
 ```bash
