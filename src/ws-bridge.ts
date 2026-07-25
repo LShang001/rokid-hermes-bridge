@@ -9,6 +9,20 @@ import { streamToHermes, type HermesConfig, type TokenUsage } from "./hermes-cli
 
 const VERBOSE = process.env.BRIDGE_VERBOSE === "1";
 
+/**
+ * 清洗 delta 文本，过滤 Hermes 偶尔混进来的 markdown 符号。
+ * TTS 会把 **加粗**、`代码`、# 标题 念出来，必须剥掉。
+ */
+function cleanForTTS(text: string): string {
+  return text
+    .replace(/\*\*([^*]*)\*\*/g, "$1")   // **bold** → bold
+    .replace(/\*([^*]*)\*/g, "$1")         // *italic* → italic
+    .replace(/`([^`]*)`/g, "$1")           // `code` → code
+    .replace(/^#{1,6}\s+/gm, "")           // ## 标题 → 标题
+    .replace(/^[-*•]\s+/gm, "")            // - 列表项 → 列表项
+    .replace(/^\d+\.\s+/gm, "");           // 1. 列表项 → 列表项
+}
+
 export interface BridgeConfig {
   wsUrl: string;
   linkCode: string;
@@ -17,6 +31,11 @@ export interface BridgeConfig {
   reconnectBaseDelayMs: number;
   /** 空闲多久后开启新会话（毫秒），避免历史无限增长拖慢首字延迟 */
   sessionIdleMs: number;
+  /**
+   * 收到请求后立即回送的确认词，消除 Hermes 处理期间的死寂。
+   * 默认"嗯，"，设为空字符串禁用。
+   */
+  ackWord: string;
   hermes: HermesConfig;
 }
 
@@ -231,11 +250,16 @@ export function createBridgeService(config: BridgeConfig) {
     const hermesSessionId = resolveSessionId();
     console.log(`[ws] Request #${requestCount} ${request.requestId.slice(-8)} session=${hermesSessionId.slice(-8)}`);
 
+    // 立即回送确认词，消除 Hermes 处理期间的 2s 死寂
+    if (config.ackWord) {
+      sendStreamChunk(request.requestId, config.ackWord);
+    }
+
     try {
       await streamToHermes(config.hermes, request.messages, hermesSessionId, ctrl.signal, {
         onDelta: (delta) => {
           if (ctrl.signal.aborted || toolCallEmitted) return;
-          sendStreamChunk(request.requestId, delta);
+          sendStreamChunk(request.requestId, cleanForTTS(delta));
         },
         onToolCall: (toolCall) => {
           if (ctrl.signal.aborted || toolCallEmitted) return;

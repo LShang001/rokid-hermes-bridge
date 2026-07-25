@@ -43,6 +43,10 @@ const config: BridgeConfig = {
   reconnectBaseDelayMs: envInt("ROKID_RECONNECT_DELAY", 1000),
   sessionIdleMs: envInt("ROKID_SESSION_IDLE_SEC", 600) * 1000,
 
+  // 收到请求后立即回送的确认词，消除 Hermes 处理期间的死寂
+  // 设为空字符串禁用：BRIDGE_ACK_WORD=""
+  ackWord: env("BRIDGE_ACK_WORD", "嗯，"),
+
   // Hermes Gateway
   hermes: {
     baseUrl: env("HERMES_BASE_URL", "http://127.0.0.1:8642"),
