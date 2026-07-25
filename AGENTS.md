@@ -8,12 +8,18 @@ Rokid AR 眼镜接入 Hermes Agent 的桥接服务。作为 WebSocket **客户�
 
 ```bash
 npm run build    # tsc → dist/
-npm run dev      # 编译并运行
-npm start        # 只运行 dist/
+npm run dev      # 编译并运行（自动加载 .env）
+npm start        # 只运行 dist/（自动加载 .env）
 ```
 
 配置从 `.env` 读（`--env-file-if-exists`，需 Node ≥ 20.12）。已设好的环境变量优先于 `.env`，
 所以内联覆盖单个值仍然可用：`HERMES_REASONING=high npm start`。
+
+stats 端点（默认 9642，`BRIDGE_HTTP_PORT=0` 禁用）：
+```bash
+curl http://127.0.0.1:9642/stats   # 上下文 token 占用、会话状态、WS 连接状态
+curl http://127.0.0.1:9642/health  # 简单健康检查
+```
 
 无测试框架。验证方式见 §原则 第 2 条。
 

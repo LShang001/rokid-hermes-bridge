@@ -5,81 +5,73 @@
 
 import WebSocket from "ws";
 import type { WsBridgeRequest, DeviceToolCall } from "./protocol.js";
-import { streamToHermes, type HermesConfig } from "./hermes-client.js";
+import { streamToHermes, type HermesConfig, type TokenUsage } from "./hermes-client.js";
+
+const VERBOSE = process.env.BRIDGE_VERBOSE === "1";
 
 export interface BridgeConfig {
-  /** Rokid 云 WebSocket 地址 */
   wsUrl: string;
-  /** 设备 linkCode */
   linkCode: string;
-  /** 设备 linkSecret */
   linkSecret: string;
-  /** 重连最大次数 */
   reconnectMaxRetries: number;
-  /** 重连基础延迟 (ms) */
   reconnectBaseDelayMs: number;
   /** 空闲多久后开启新会话（毫秒），避免历史无限增长拖慢首字延迟 */
   sessionIdleMs: number;
-  /** Hermes Gateway 配置 */
   hermes: HermesConfig;
+}
+
+export interface BridgeStats {
+  uptime: number;
+  linkCode: string;
+  ws: {
+    status: "connected" | "disconnected" | "reconnecting";
+    reconnectAttempt: number;
+  };
+  session: {
+    id: string | null;
+    startedAt: string | null;
+    lastActivityAt: string | null;
+    rotations: number;
+    idleTimeoutSec: number;
+  };
+  tokens: {
+    promptTotal: number;
+    completionTotal: number;
+    total: number;
+    requestCount: number;
+    /** 最近一次请求的 prompt token 数，是当前上下文体量的直接指标 */
+    lastPromptTokens: number;
+  };
 }
 
 // ------ 下行帧类型 ------
 
 interface WsBridgeMessageFrame {
   event: "message";
-  data: {
-    role: "agent";
-    message_id: string;
-    agent_id: string;
-    answer_stream: string;
-    is_finish: false;
-    type: "answer";
-  };
+  data: { role: "agent"; message_id: string; agent_id: string; answer_stream: string; is_finish: false; type: "answer" };
 }
 
 interface WsBridgeDoneFrame {
   event: "done";
-  data: {
-    role: "agent";
-    message_id: string;
-    agent_id: string;
-    answer_stream: "";
-    is_finish: true;
-    type: "answer";
-  };
+  data: { role: "agent"; message_id: string; agent_id: string; answer_stream: ""; is_finish: true; type: "answer" };
 }
 
 interface WsBridgeErrorFrame {
-  type: "error";
-  requestId: string;
-  code: string;
-  message: string;
+  type: "error"; requestId: string; code: string; message: string;
 }
 
 interface WsBridgeStatusFrame {
-  type: "status";
-  connected: boolean;
+  type: "status"; connected: boolean;
 }
 
 interface WsBridgeToolCallFrame {
   event: "done";
-  data: {
-    role: "agent";
-    message_id: string;
-    agent_id: string;
-    is_finish: true;
-    type: "tool_call";
-    tool_call: DeviceToolCall;
-  };
+  data: { role: "agent"; message_id: string; agent_id: string; is_finish: true; type: "tool_call"; tool_call: DeviceToolCall };
 }
 
 type OutboundFrame =
-  | WsBridgeMessageFrame
-  | WsBridgeDoneFrame
-  | WsBridgeErrorFrame
-  | WsBridgeStatusFrame
-  | WsBridgeToolCallFrame;
+  | WsBridgeMessageFrame | WsBridgeDoneFrame | WsBridgeErrorFrame
+  | WsBridgeStatusFrame | WsBridgeToolCallFrame;
 
 // ------ 工具函数 ------
 
@@ -99,86 +91,95 @@ function backoffDelay(attempt: number, baseMs: number, maxMs = 30000): number {
 // ------ 主服务 ------
 
 export function createBridgeService(config: BridgeConfig) {
+  const startedAt = Date.now();
   let ws: WebSocket | null = null;
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
-  let toolCallEmitted = false;
 
   /** 当前活跃请求的 AbortController */
   let activeCtrl: AbortController | null = null;
 
-  /** 当前会话 id（传给 Hermes 的 X-Hermes-Session-Id），空闲超时后轮换 */
-  let sessionId: string | null = null;
-  let lastRequestAt = 0;
+  // ------ Session 管理 ------
 
-  /**
-   * 取当前会话 id。空闲超过 sessionIdleMs 就开新会话：
-   * Hermes 会把历史回灌进 prompt，无限增长会持续拖慢首字延迟。
-   */
+  let sessionId: string | null = null;
+  let sessionStartedAt = 0;
+  let lastRequestAt = 0;
+  let sessionRotations = 0;
+
   function resolveSessionId(): string {
     const now = Date.now();
     const expired = lastRequestAt > 0 && now - lastRequestAt > config.sessionIdleMs;
     if (!sessionId || expired) {
       if (expired) {
-        console.log(`[ws] Session idle > ${Math.round(config.sessionIdleMs / 1000)}s, starting new session`);
+        console.log(`[ws] Session idle >${Math.round(config.sessionIdleMs / 1000)}s, starting new session`);
+        sessionRotations++;
       }
       sessionId = `rokid-${config.linkCode}-${now.toString(36)}`;
+      sessionStartedAt = now;
     }
     lastRequestAt = now;
     return sessionId;
   }
 
+  // ------ Stats 追踪 ------
+
+  let wsStatus: BridgeStats["ws"]["status"] = "disconnected";
+  let promptTokensTotal = 0;
+  let completionTokensTotal = 0;
+  let lastPromptTokens = 0;
+  let requestCount = 0;
+
+  function recordUsage(usage: TokenUsage) {
+    promptTokensTotal += usage.promptTokens;
+    completionTokensTotal += usage.completionTokens;
+    lastPromptTokens = usage.promptTokens;
+  }
+
+  function getStats(): BridgeStats {
+    return {
+      uptime: Math.round((Date.now() - startedAt) / 1000),
+      linkCode: config.linkCode,
+      ws: { status: wsStatus, reconnectAttempt },
+      session: {
+        id: sessionId,
+        startedAt: sessionStartedAt > 0 ? new Date(sessionStartedAt).toISOString() : null,
+        lastActivityAt: lastRequestAt > 0 ? new Date(lastRequestAt).toISOString() : null,
+        rotations: sessionRotations,
+        idleTimeoutSec: Math.round(config.sessionIdleMs / 1000),
+      },
+      tokens: {
+        promptTotal: promptTokensTotal,
+        completionTotal: completionTokensTotal,
+        total: promptTokensTotal + completionTokensTotal,
+        requestCount,
+        lastPromptTokens,
+      },
+    };
+  }
+
+  // ------ 发送帧 ------
+
   function sendWs(msg: OutboundFrame) {
     if (ws?.readyState === WebSocket.OPEN) {
       const raw = JSON.stringify(msg);
-      console.log(`[ws] >>> ${raw.slice(0, 200)}`);
+      if (VERBOSE) console.log(`[ws] >>> ${raw.slice(0, 200)}`);
       ws.send(raw);
     }
   }
 
   function sendStreamChunk(requestId: string, delta: string) {
     if (!delta) return;
-    sendWs({
-      event: "message",
-      data: {
-        role: "agent",
-        message_id: requestId,
-        agent_id: "hermes",
-        answer_stream: delta,
-        is_finish: false,
-        type: "answer",
-      },
-    });
+    sendWs({ event: "message", data: { role: "agent", message_id: requestId, agent_id: "hermes", answer_stream: delta, is_finish: false, type: "answer" } });
   }
 
   function sendDone(requestId: string) {
-    sendWs({
-      event: "done",
-      data: {
-        role: "agent",
-        message_id: requestId,
-        agent_id: "hermes",
-        answer_stream: "",
-        is_finish: true,
-        type: "answer",
-      },
-    });
+    sendWs({ event: "done", data: { role: "agent", message_id: requestId, agent_id: "hermes", answer_stream: "", is_finish: true, type: "answer" } });
   }
 
   function sendToolCall(requestId: string, toolCall: DeviceToolCall) {
-    toolCallEmitted = true;
-    sendWs({
-      event: "done",
-      data: {
-        role: "agent",
-        message_id: requestId,
-        agent_id: "hermes",
-        is_finish: true,
-        type: "tool_call",
-        tool_call: toolCall,
-      },
-    });
+    sendWs({ event: "done", data: { role: "agent", message_id: requestId, agent_id: "hermes", is_finish: true, type: "tool_call", tool_call: toolCall } });
   }
 
   function sendError(requestId: string, message: string) {
@@ -190,14 +191,10 @@ export function createBridgeService(config: BridgeConfig) {
   function handleMessage(raw: string) {
     let msg: unknown;
     try { msg = JSON.parse(raw); }
-    catch {
-      console.warn(`[ws] Invalid JSON: ${raw.slice(0, 200)}`);
-      return;
-    }
+    catch { console.warn(`[ws] Invalid JSON: ${raw.slice(0, 200)}`); return; }
     if (!msg || typeof msg !== "object") return;
     const parsed = msg as Record<string, unknown>;
 
-    // 取消
     if (parsed.type === "cancel" && typeof parsed.requestId === "string") {
       if (activeCtrl) {
         console.log(`[ws] Cancel request ${parsed.requestId}`);
@@ -207,24 +204,18 @@ export function createBridgeService(config: BridgeConfig) {
       return;
     }
 
-    // 兼容两种字段名
     const messages = parsed.messages ?? parsed.message;
     const requestId = parsed.requestId ?? parsed.message_id;
 
     if (Array.isArray(messages) && typeof requestId === "string") {
-      void handleChatRequest({
-        messages: messages as any,
-        requestId,
-        sessionKey: parsed.sessionKey as string | undefined,
-      });
+      void handleChatRequest({ messages: messages as any, requestId, sessionKey: parsed.sessionKey as string | undefined });
       return;
     }
 
-    console.warn(`[ws] Unrecognized message: ${raw.slice(0, 200)}`);
+    if (VERBOSE) console.warn(`[ws] Unrecognized message: ${raw.slice(0, 200)}`);
   }
 
   async function handleChatRequest(request: WsBridgeRequest) {
-    // 打断上一个请求
     if (activeCtrl) {
       console.log(`[ws] Interrupting previous request`);
       activeCtrl.abort();
@@ -233,10 +224,12 @@ export function createBridgeService(config: BridgeConfig) {
 
     const ctrl = new AbortController();
     activeCtrl = ctrl;
-    toolCallEmitted = false;
+    // toolCallEmitted 是 request 局部状态，不污染外层闭包
+    let toolCallEmitted = false;
 
+    requestCount++;
     const hermesSessionId = resolveSessionId();
-    console.log(`[ws] Processing request ${request.requestId}, messages=${request.messages.length}, session=${hermesSessionId}`);
+    console.log(`[ws] Request #${requestCount} ${request.requestId.slice(-8)} session=${hermesSessionId.slice(-8)}`);
 
     try {
       await streamToHermes(config.hermes, request.messages, hermesSessionId, ctrl.signal, {
@@ -246,7 +239,8 @@ export function createBridgeService(config: BridgeConfig) {
         },
         onToolCall: (toolCall) => {
           if (ctrl.signal.aborted || toolCallEmitted) return;
-          console.log(`[ws] Tool call: ${JSON.stringify(toolCall)}`);
+          toolCallEmitted = true;
+          console.log(`[ws] Tool call: ${toolCall.command}`);
           sendToolCall(request.requestId, toolCall);
           ctrl.abort();
         },
@@ -256,16 +250,16 @@ export function createBridgeService(config: BridgeConfig) {
         },
         onError: (err) => {
           console.error(`[ws] Hermes error: ${err.message}`);
-          if (!ctrl.signal.aborted && !toolCallEmitted) {
-            sendError(request.requestId, err.message);
-          }
+          if (!ctrl.signal.aborted && !toolCallEmitted) sendError(request.requestId, err.message);
+        },
+        onUsage: (usage) => {
+          recordUsage(usage);
+          if (VERBOSE) console.log(`[ws] Tokens prompt=${usage.promptTokens} completion=${usage.completionTokens}`);
         },
       });
     } catch (err: any) {
-      console.error(`[ws] Request ${request.requestId} failed: ${err.message}`);
-      if (!ctrl.signal.aborted && !toolCallEmitted) {
-        sendError(request.requestId, err.message);
-      }
+      console.error(`[ws] Request failed: ${err.message}`);
+      if (!ctrl.signal.aborted && !toolCallEmitted) sendError(request.requestId, err.message);
     } finally {
       if (activeCtrl === ctrl) activeCtrl = null;
     }
@@ -278,22 +272,33 @@ export function createBridgeService(config: BridgeConfig) {
 
     const fullWsUrl = buildWsUrl(config);
     console.log(`[ws] Connecting (attempt ${reconnectAttempt + 1})...`);
+    wsStatus = "reconnecting";
 
     ws = new WebSocket(fullWsUrl);
 
     ws.on("open", () => {
       reconnectAttempt = 0;
+      wsStatus = "connected";
       console.log(`[ws] Connected to Rokid cloud`);
       sendWs({ type: "status", connected: true });
+
+      // 心跳：每 30 秒 ping 一次，检测半开 TCP 连接
+      pingTimer = setInterval(() => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.ping();
+        }
+      }, 30_000);
     });
 
     ws.on("message", (data) => {
       const raw = data.toString();
-      console.log(`[ws] <<< ${raw.slice(0, 300)}`);
+      if (VERBOSE) console.log(`[ws] <<< ${raw.slice(0, 300)}`);
       handleMessage(raw);
     });
 
-    ws.on("close", (code, reason) => {
+    ws.on("close", (code) => {
+      wsStatus = "disconnected";
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       console.warn(`[ws] Disconnected (code=${code})`);
       scheduleReconnect();
     });
@@ -305,13 +310,22 @@ export function createBridgeService(config: BridgeConfig) {
 
   function scheduleReconnect() {
     if (stopped) return;
-    if (reconnectAttempt >= config.reconnectMaxRetries) {
-      console.error(`[ws] Max retries (${config.reconnectMaxRetries}) exhausted. Giving up.`);
-      return;
-    }
-    const delay = backoffDelay(reconnectAttempt, config.reconnectBaseDelayMs);
+
+    // 耗尽初始重试次数后不再放弃，改为每 5 分钟重试一次
+    const exhausted = reconnectAttempt >= config.reconnectMaxRetries;
+    const delay = exhausted
+      ? 5 * 60 * 1000
+      : backoffDelay(reconnectAttempt, config.reconnectBaseDelayMs);
+
     reconnectAttempt++;
-    console.log(`[ws] Reconnecting in ${Math.round(delay)}ms...`);
+    wsStatus = "reconnecting";
+
+    if (exhausted) {
+      console.warn(`[ws] Initial retries exhausted, switching to 5-min interval (attempt ${reconnectAttempt})`);
+    } else {
+      console.log(`[ws] Reconnecting in ${Math.round(delay / 1000)}s...`);
+    }
+
     reconnectTimer = setTimeout(connect, delay);
   }
 
@@ -323,9 +337,12 @@ export function createBridgeService(config: BridgeConfig) {
     stop() {
       stopped = true;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       if (activeCtrl) { activeCtrl.abort(); activeCtrl = null; }
       if (ws) { ws.removeAllListeners(); if (ws.readyState === WebSocket.OPEN) ws.close(1000, "Shutdown"); ws = null; }
+      wsStatus = "disconnected";
       console.log("[ws] Service stopped");
     },
+    getStats,
   };
 }

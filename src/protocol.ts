@@ -38,15 +38,3 @@ export interface DeviceToolCall {
   start_time?: string;
   end_time?: string;
 }
-
-export interface WsBridgeToolCallFrame {
-  event: "done";
-  data: {
-    role: "agent";
-    message_id: string;
-    agent_id: string;
-    is_finish: true;
-    type: "tool_call";
-    tool_call: DeviceToolCall;
-  };
-}

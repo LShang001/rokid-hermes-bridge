@@ -4,6 +4,8 @@
 
 import type { MessageObject, DeviceToolCall } from "./protocol.js";
 
+const VERBOSE = process.env.BRIDGE_VERBOSE === "1";
+
 /** 思考强度：off 关闭推理（最快），其余为 Hermes 的 effort 档位 */
 export type ReasoningLevel = "off" | "low" | "medium" | "high";
 
@@ -12,6 +14,19 @@ export interface HermesConfig {
   apiKey: string;
   /** 眼镜场景默认降低思考强度以压低首字延迟 */
   reasoning: ReasoningLevel;
+  /**
+   * 稳定的长期记忆 key（X-Hermes-Session-Key）。
+   * 不同于会话 id（空闲后轮换），此 key 跨会话持续，
+   * 让 Hermes 的 Honcho 记忆层在换了 session 后依然认识你。
+   */
+  sessionKey: string;
+  /** Hermes 请求超时（毫秒），默认 60000 */
+  requestTimeoutMs: number;
+}
+
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
 }
 
 export interface StreamCallbacks {
@@ -19,6 +34,8 @@ export interface StreamCallbacks {
   onToolCall: (toolCall: DeviceToolCall) => void;
   onDone: () => void;
   onError: (error: Error) => void;
+  /** Hermes 在最后一帧里返回本次请求的 token 用量 */
+  onUsage?: (usage: TokenUsage) => void;
 }
 
 const TOOL_FENCE_OPEN = "```rokid-tool";
@@ -45,7 +62,6 @@ export class ToolFenceScanner {
       if (!this.inFence) {
         const idx = this.buffer.indexOf(TOOL_FENCE_OPEN);
         if (idx === -1) {
-          // 缓冲区尾部可能是围栏标记的前缀，保留待续；其余部分可以安全放出
           const safeLen = this.longestSafeSuffixCut(this.buffer, TOOL_FENCE_OPEN);
           out += this.buffer.slice(0, safeLen);
           this.buffer = this.buffer.slice(safeLen);
@@ -74,7 +90,6 @@ export class ToolFenceScanner {
     return out;
   }
 
-  /** 上一次 push() 中是否闭合了一个工具围栏；取出其原始 JSON 文本 */
   pendingToolJson: string | null = null;
 
   takePendingToolJson(): string | null {
@@ -83,7 +98,6 @@ export class ToolFenceScanner {
     return v;
   }
 
-  /** 流结束时缓冲区里剩余的纯文本（未闭合的围栏视为普通文本原样吐出） */
   flush(): string {
     if (this.inFence) {
       const rest = TOOL_FENCE_OPEN + this.fenceBody + this.buffer;
@@ -97,7 +111,6 @@ export class ToolFenceScanner {
     return rest;
   }
 
-  /** 计算 buffer 中可以安全输出的前缀长度，避免切断跨 chunk 的围栏标记 */
   private longestSafeSuffixCut(buffer: string, marker: string): number {
     const maxOverlap = Math.min(marker.length - 1, buffer.length);
     for (let len = maxOverlap; len > 0; len--) {
@@ -154,7 +167,6 @@ function toOpenAIMessages(messages: MessageObject[]): OpenAIMessage[] {
     if (msg.type === "text" && msg.text) {
       textParts.push(msg.text);
     } else if (msg.type === "image" && msg.image_url) {
-      // 先提交累积的文本
       if (textParts.length > 0) {
         parts.push({ type: "text", text: textParts.join("\n") });
         textParts = [];
@@ -162,18 +174,15 @@ function toOpenAIMessages(messages: MessageObject[]): OpenAIMessage[] {
       parts.push({ type: "image_url", image_url: { url: msg.image_url } });
     }
   }
-  // 提交剩余文本
   if (textParts.length > 0) {
     parts.push({ type: "text", text: textParts.join("\n") });
   }
 
   const systemMsg: OpenAIMessage = { role: "system", content: TOOL_CONVENTION_SYSTEM_PROMPT };
 
-  // 纯文本消息用简单格式
   if (parts.length === 1 && parts[0].type === "text") {
     return [systemMsg, { role: "user", content: parts[0].text! }];
   }
-  // 多模态消息
   return [systemMsg, { role: "user", content: parts }];
 }
 
@@ -190,8 +199,6 @@ export async function streamToHermes(
 ): Promise<void> {
   const openaiMessages = toOpenAIMessages(messages);
 
-  // model_options 是 Hermes 的逐请求运行时覆盖，只影响本次调用，
-  // 不改动 Hermes 全局配置（CLI 等其它平台不受影响）。
   const reasoning =
     config.reasoning === "off"
       ? { enabled: false }
@@ -205,7 +212,11 @@ export async function streamToHermes(
   });
 
   const url = `${config.baseUrl}/v1/chat/completions`;
-  console.log(`[hermes] → POST ${url} (${body.length} bytes)`);
+  if (VERBOSE) console.log(`[hermes] → POST ${url} (${body.length} bytes)`);
+
+  // 请求超时：独立于 signal（signal 处理打断，timeout 处理 Hermes 挂住）
+  const timeoutSignal = AbortSignal.timeout(config.requestTimeoutMs);
+  const combinedSignal = AbortSignal.any([signal, timeoutSignal]);
 
   try {
     const response = await fetch(url, {
@@ -213,13 +224,13 @@ export async function streamToHermes(
       headers: {
         "Authorization": `Bearer ${config.apiKey}`,
         "Content-Type": "application/json",
-        // 不带此头时 Hermes 会用 hash(system_prompt + 首条 user 消息) 推导
-        // session id，而桥接每次只发当前一句话，导致每轮都变成新会话、
-        // 上下文丢失。显式带上稳定 id，让 Hermes 从 state.db 读取历史。
+        // 会话历史：Hermes 从 state.db 读取，不再靠 hash(system+首句) 推导
         "X-Hermes-Session-Id": sessionId,
+        // 长期记忆 key：跨会话轮换持续，Honcho 用它识别同一用户
+        "X-Hermes-Session-Key": config.sessionKey,
       },
       body,
-      signal,
+      signal: combinedSignal,
     });
 
     if (!response.ok) {
@@ -255,10 +266,18 @@ export async function streamToHermes(
         }
         try {
           const parsed = JSON.parse(data);
+
+          // 顶层 usage 字段（在最后一个有 finish_reason 的帧里）
+          if (parsed.usage?.prompt_tokens) {
+            callbacks.onUsage?.({
+              promptTokens: parsed.usage.prompt_tokens,
+              completionTokens: parsed.usage.completion_tokens ?? 0,
+            });
+          }
+
           const choice = parsed.choices?.[0];
           if (!choice) continue;
 
-          // 文本增量：经围栏扫描器过滤出 ```rokid-tool 代码块
           const delta = choice.delta?.content;
           if (delta) {
             const safeText = fenceScanner.push(delta);
@@ -274,7 +293,7 @@ export async function streamToHermes(
             }
           }
         } catch {
-          // 忽略解析失败的行
+          // 忽略解析失败的行（hermes.tool.progress 等自定义事件）
         }
       }
     }
@@ -282,7 +301,13 @@ export async function streamToHermes(
     if (rest) callbacks.onDelta(rest);
     callbacks.onDone();
   } catch (err: any) {
-    if (err.name === "AbortError") return;
+    if (err.name === "AbortError" || err.name === "TimeoutError") {
+      if (err.name === "TimeoutError") {
+        console.error(`[hermes] Request timed out after ${config.requestTimeoutMs}ms`);
+        callbacks.onError(new Error(`Hermes request timed out after ${config.requestTimeoutMs}ms`));
+      }
+      return;
+    }
     callbacks.onError(err instanceof Error ? err : new Error(String(err)));
   }
 }
